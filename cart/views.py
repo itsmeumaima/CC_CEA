@@ -67,13 +67,14 @@ def checkout(request):
         ]
 
         #  Create checkout session
+        
         session = stripe.checkout.Session.create(
-            payment_method_types=['card'],
             line_items=line_items,
             mode='payment',
             success_url=request.build_absolute_uri('/cart/success/') + '?session_id={CHECKOUT_SESSION_ID}',
             cancel_url=request.build_absolute_uri('/cart/cancel/'),
         )
+
 
         # Save Payment record with session.id instead
         Payment.objects.create(
@@ -84,10 +85,13 @@ def checkout(request):
         )
 
         return redirect(session.url, code=303)
-
     except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.exception("Stripe checkout failed")
         messages.error(request, f"Payment error: {str(e)}")
         return redirect('cart:view_cart')
+    
 
 # cart/views.py (continued)
 @login_required
