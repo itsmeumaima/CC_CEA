@@ -12,5 +12,5 @@ requests
 sqlparse
 storage
 stripe
-dotenv
+python-dotenv
 mysqlclient
