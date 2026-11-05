@@ -32,8 +32,8 @@ SECRET_KEY = os.environ["DJANGO_SECRET_KEY"]
 DEBUG = os.getenv("DJANGO_DEBUG", "False").lower() == "true"
 
 ALLOWED_HOSTS = [
-    "32.196.116.20",
-    "ec2-32-196-116-20.compute-1.amazonaws.com",
+    "100.63.203.97",
+    "ec2-100-63-203-97.compute-1.amazonaws.com",
     "3.83.79.123",
     "localhost",
     "127.0.0.1",
