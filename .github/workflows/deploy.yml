@@ -14,7 +14,8 @@ permissions:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: postsync-web
-  EC2_INSTANCE_ID: i-093bf1c5b6bedbdde
+  ASG_NAME: postsync-asg
+  AWS_ACCOUNT_ID: "045245878007"
 
 jobs:
   build-and-deploy:
@@ -46,51 +47,148 @@ jobs:
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          docker tag $ECR_REPOSITORY:${GITHUB_SHA} $REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}
-          docker tag $ECR_REPOSITORY:${GITHUB_SHA} $REGISTRY/$ECR_REPOSITORY:latest
+          docker tag $ECR_REPOSITORY:${GITHUB_SHA} \
+            $REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}
+
+          docker tag $ECR_REPOSITORY:${GITHUB_SHA} \
+            $REGISTRY/$ECR_REPOSITORY:latest
+
           docker push $REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}
           docker push $REGISTRY/$ECR_REPOSITORY:latest
 
-      - name: Deploy to EC2 using SSM
+      - name: Find healthy Auto Scaling instances
+        id: discover
+        shell: bash
         run: |
+          echo "Checking Auto Scaling Group: $ASG_NAME"
+
+          mapfile -t ASG_IDS < <(
+            aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "$ASG_NAME" \
+              --region "$AWS_REGION" \
+              --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService` && HealthStatus==`Healthy`].InstanceId' \
+              --output text | tr '\t' '\n'
+          )
+
+          if [ ${#ASG_IDS[@]} -eq 0 ] || [ -z "${ASG_IDS[0]}" ]; then
+            echo "ERROR: No healthy ASG instances found."
+            exit 1
+          fi
+
+          echo "ASG instances:"
+          printf '%s\n' "${ASG_IDS[@]}"
+
+          mapfile -t SSM_IDS < <(
+            aws ssm describe-instance-information \
+              --region "$AWS_REGION" \
+              --filters "Key=PingStatus,Values=Online" \
+              --query 'InstanceInformationList[].InstanceId' \
+              --output text | tr '\t' '\n'
+          )
+
+          ONLINE_IDS=()
+
+          for ID in "${ASG_IDS[@]}"; do
+            if [[ " ${SSM_IDS[*]} " == *" $ID "* ]]; then
+              ONLINE_IDS+=("$ID")
+            else
+              echo "ERROR: $ID is not Online in SSM."
+              exit 1
+            fi
+          done
+
+          if [ ${#ONLINE_IDS[@]} -gt 50 ]; then
+            echo "ERROR: SSM supports at most 50 instance IDs per command."
+            exit 1
+          fi
+
+          echo "Ready to deploy to:"
+          printf '%s\n' "${ONLINE_IDS[@]}"
+
+          {
+            echo "instance_ids<<EOF"
+            printf '%s\n' "${ONLINE_IDS[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to all EC2 instances using SSM
+        shell: bash
+        env:
+          INSTANCE_IDS: ${{ steps.discover.outputs.instance_ids }}
+        run: |
+          mapfile -t TARGET_IDS <<< "$INSTANCE_IDS"
+
+          echo "Deploying to ${#TARGET_IDS[@]} instances."
+
           COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$EC2_INSTANCE_ID" \
+            --instance-ids "${TARGET_IDS[@]}" \
             --document-name "AWS-RunShellScript" \
             --parameters 'commands=[
+              "set -e",
               "cd /home/ubuntu/postsync",
               "aws ecr get-login-password --region us-east-1 | sudo docker login --username AWS --password-stdin 045245878007.dkr.ecr.us-east-1.amazonaws.com",
               "sudo docker compose pull app",
               "sudo docker compose up -d --no-build --no-deps app",
               "sudo docker image prune -f"
             ]' \
+            --region "$AWS_REGION" \
             --query 'Command.CommandId' \
             --output text)
 
-          echo "SSM command ID: $COMMAND_ID"
+          echo "SSM Command ID: $COMMAND_ID"
 
-          for attempt in $(seq 1 30); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$EC2_INSTANCE_ID" \
-              --query 'Status' \
-              --output text 2>/dev/null || true)
+          FAILED=0
 
-            echo "Deployment status: $STATUS"
+          for INSTANCE_ID in "${TARGET_IDS[@]}"; do
 
-            if [ "$STATUS" = "Success" ]; then
-              exit 0
-            fi
+            echo "Checking $INSTANCE_ID..."
 
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+            STATUS="Pending"
+
+            for attempt in $(seq 1 30); do
+
+              STATUS=$(aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$AWS_REGION" \
+                --query 'Status' \
+                --output text 2>/dev/null || true)
+
+              echo "$INSTANCE_ID: $STATUS"
+
+              if [ "$STATUS" = "Success" ]; then
+                break
+              fi
+
+              case "$STATUS" in
+                Failed|Cancelled|TimedOut|DeliveryTimedOut|ExecutionTimedOut|Undeliverable|Terminated)
+                  break
+                  ;;
+              esac
+
+              sleep 10
+            done
+
+            if [ "$STATUS" != "Success" ]; then
+
+              echo "FAILED on $INSTANCE_ID"
+
               aws ssm get-command-invocation \
                 --command-id "$COMMAND_ID" \
-                --instance-id "$EC2_INSTANCE_ID" \
-                --output json
-              exit 1
+                --instance-id "$INSTANCE_ID" \
+                --region "$AWS_REGION" \
+                --output json || true
+
+              FAILED=1
+            else
+              echo "SUCCESS on $INSTANCE_ID"
             fi
 
-            sleep 10
           done
 
-          echo "Timed out waiting for deployment."
-          exit 1
+          if [ "$FAILED" -ne 0 ]; then
+            echo "Deployment failed on one or more instances."
+            exit 1
+          fi
+
+          echo "PostSync successfully deployed to all ASG instances!"
